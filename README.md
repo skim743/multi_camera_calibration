@@ -21,6 +21,7 @@ python3 multi_camera_calibration.py --cameras wrist   # wrist only, with the sav
 
 1. If `top_calibration.json` or `wrist_calibration.json` already exists in the static dir (only the ones being calibrated are checked), it asks to overwrite or cancel before anything starts.
 2. Top camera: the board must be clear of everything, tag included. When the hole count and jitter settle, press `e`. A fit over `--max-extrinsic-rms` is refused (`r` resets, then `e` again). `q` aborts.
+   The board's 5 counterbored mounting holes (11.5 mm: center, and 11 pitches diagonally out from it) are circled orange. When 2 or more are found, they decide which detected hole is which. This keeps the board placement right when rows of holes are missed, e.g. dark near the arm base. They are also used in the pose solve. With fewer than 2, the window is the 24×24 block holding the most holes, as before, and the status line says so.
 3. Wrist camera: place the tag on the board, press Enter in the terminal, then pose the arm in teaching mode and capture views in the window (~10: varied heights, tilts, wrist angles). Keys: `Enter` capture, `d` undo, `t` re-measure the tag, `q` fit and finish. `--marker-size` must be the measured black-square side of the printed tag.
 
 ## Output

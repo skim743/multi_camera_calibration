@@ -23,6 +23,12 @@
 # (undistorted) centers gives the camera pose. Also offline from a saved snapshot:
 #   python3 top_camera_calibration.py --extrinsic-from data/breadboard/<ts>_breadboard_holes.json
 #
+# Counterbores: the MB2424 also has five 11.5 mm counterbored mounting holes, at the center and
+# 11 pitches diagonally out from it, each in the middle of four taps (a half-pitch grid point).
+# Their pattern fixes which tracked index is the board corner, so the board window stays right
+# when rows of taps are missed (e.g. dark near the arm base); two or more must agree, else the
+# window is the block holding the most taps. Their centers also go into the extrinsic.
+#
 # Hole indices are relative to the first fitted frame (seed hole = (0, 0)) and are carried
 # frame to frame by the previous homography. They are not tied to the physical board corner;
 # if tracking is lost the labels re-seed and the stats reset.
@@ -41,6 +47,13 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 PITCH_MM = 25.4  # MB2424 hole pitch (1")
+
+
+def counterbore_offsets(b):
+    # Lower-left tap of each counterbore, from the board corner: center, then the 4 corners
+    # (MB2424: (11, 11), (0, 0), (0, 22), (22, 0), (22, 22))
+    c, e = (b - 2) // 2, b - 2
+    return ((c, c), (0, 0), (0, e), (e, 0), (e, e))
 
 
 def timestamp():
@@ -182,6 +195,10 @@ class GridFitter:
         self.H = None             # carried between frames so labels stay consistent
         self.window = None        # (i0, j0) lower corner of the board window, in tracked indices
         self.reseeded = False     # last fit() replaced the tracked labels
+        self.cb_pts = np.zeros((0, 2))  # counterbore candidates (undistorted px), set before fit()
+        self.cb = {}              # counterbore blob per lower-left tap index, for the last H
+        self.window_cbs = 0       # counterbores that placed the window (0: placed by tap count)
+        self.forced_window = None # board_window() uses this instead of counting, when set
 
     def reset(self):
         self.H = None
@@ -229,7 +246,24 @@ class GridFitter:
             key = (gi[n, 0], gi[n, 1])
             if key not in best or res[n] < res[best[key]]:
                 best[key] = n
+        self.counterbores(H)
         return self.board_window(best)
+
+    def counterbores(self, H):
+        """Counterbore candidates on a half-pitch grid point -> self.cb {lower-left tap index: blob}."""
+        self.cb = {}
+        if len(self.cb_pts) == 0:
+            return
+        g = cv2.perspectiveTransform(self.cb_pts[None], np.linalg.inv(H))[0]
+        sane = np.all(np.isfinite(g) & (np.abs(g) < 1000), axis=1)
+        g = np.where(sane[:, None], g, 0.0)
+        lo = np.floor(g).astype(int)
+        res = np.abs(g - lo - 0.5).max(1)
+        res = np.where(sane, res, np.inf)
+        for n in np.flatnonzero(res < self.tol):
+            key = (lo[n, 0], lo[n, 1])
+            if key not in self.cb or res[n] < res[self.cb[key]]:
+                self.cb[key] = n
 
     def board_window(self, best):
         # The grid extrapolates past the board, so blobs on the floor/arm can land on a grid
@@ -237,23 +271,58 @@ class GridFitter:
         # keep only the block holding the most holes.
         if not self.board_size or not best:
             return best
+        b = self.board_size
+        if self.forced_window is not None:
+            i0, j0 = self.window = self.forced_window
+            return {k: n for k, n in best.items() if i0 <= k[0] < i0 + b and j0 <= k[1] < j0 + b}
         gi = np.array(list(best.keys()))
         if np.ptp(gi, axis=0).max() > 10 * self.board_size:
             # Shouldn't happen after assign()'s guard; keep the table small regardless
             near = np.all(np.abs(gi - np.median(gi, axis=0)) <= 2 * self.board_size, axis=1)
             best = {k: n for (k, n), ok in zip(best.items(), near) if ok}
             gi = gi[near]
-        lo = gi.min(0) - self.board_size + 1
-        occ = np.zeros(gi.max(0) - lo + 1, dtype=np.int32)
-        occ[gi[:, 0] - lo[0], gi[:, 1] - lo[1]] = 1
-        # 2D prefix sum -> hole count of every board_size window (lower corner at each cell)
-        c = np.pad(occ.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
-        b = self.board_size
-        win = c[b:, b:] - c[:-b, b:] - c[b:, :-b] + c[:-b, :-b]
+        lo, win = self.window_counts(gi)
         i0, j0 = np.unravel_index(np.argmax(win), win.shape) + lo
         self.window = (int(i0), int(j0))
         return {k: n for k, n in best.items()
                 if i0 <= k[0] < i0 + b and j0 <= k[1] < j0 + b}
+
+    def window_counts(self, gi):
+        """Hole count of every board_size window -> (lower corner of win[0, 0], win)."""
+        b = self.board_size
+        lo = gi.min(0) - b + 1
+        occ = np.zeros(gi.max(0) - lo + 1, dtype=np.int32)
+        occ[gi[:, 0] - lo[0], gi[:, 1] - lo[1]] = 1
+        # 2D prefix sum -> hole count of every board_size window (lower corner at each cell)
+        c = np.pad(occ.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+        return lo, c[b:, b:] - c[:-b, b:] - c[b:, :-b] + c[:-b, :-b]
+
+    def counterbore_window(self, pts, H):
+        """Board window from the counterbores on the converged grid: ((i0, j0), votes), or None
+        unless 2+ agree (one could be debris at a half-pitch point). Each counterbore votes once
+        for each window it fits; the tap count breaks ties (center + one corner fits two)."""
+        b = self.board_size
+        if not b or len(self.cb_pts) == 0:
+            return None
+        self.board_size = 0                     # every tap on the grid, not just the current window
+        try:
+            best = self.assign(pts, H)
+        finally:
+            self.board_size = b
+        if not best or len(self.cb) < 2:
+            return None
+        gi = np.array(list(best.keys()))
+        lo, win = self.window_counts(gi)
+        hit = np.zeros(win.shape, dtype=np.int64)
+        for key in self.cb:
+            for off in counterbore_offsets(b):
+                w = (key[0] - off[0] - lo[0], key[1] - off[1] - lo[1])
+                if 0 <= w[0] < hit.shape[0] and 0 <= w[1] < hit.shape[1]:
+                    hit[w] += 1
+        if hit.max() < 2:
+            return None
+        w = np.unravel_index(np.argmax(hit * (b * b + 1) + win), win.shape)
+        return (int(w[0] + lo[0]), int(w[1] + lo[1])), int(hit[w])
 
     def grow(self, pts, H):
         """Assign holes from a starting homography, refitting outward. -> (H, best, rms px)."""
@@ -326,7 +395,7 @@ class GridFitter:
     def fit(self, pts):
         self.reseeded = False
         if len(pts) < self.min_holes:
-            self.H = None
+            self.H, self.cb = None, {}
             return None, {}
         if self.H is not None and not np.all(np.isfinite(self.H)):
             self.H = None
@@ -347,9 +416,26 @@ class GridFitter:
                     H, best = fresh[0], fresh[1]
                     self.reseeded = self.H is not None          # labels changed
         if H is None:
-            self.H = None
+            self.H, self.cb = None, {}
             return None, {}
-        self.assign(pts, H)                                     # leaves self.window for this H
+        # The tap-count window can be off when rows are missed (dark near the arm base) or blobs
+        # beyond the board sit on grid points; the counterbores, once seen on the converged grid,
+        # fix it, and the grid is refitted inside their window
+        cbw = self.counterbore_window(pts, H)
+        self.window_cbs = 0
+        if cbw is not None:
+            self.forced_window = cbw[0]
+            try:
+                H2, best2, _ = self.grow(pts, H)
+            finally:
+                self.forced_window = None
+            if H2 is not None:
+                H, best, self.window_cbs = H2, best2, cbw[1]
+        self.forced_window = cbw[0] if self.window_cbs else None
+        try:
+            self.assign(pts, H)                                 # leaves self.window, self.cb for this H
+        finally:
+            self.forced_window = None
         self.H = H
         return H, best
 
@@ -414,6 +500,7 @@ class BreadboardHoleTest:
         self.fitter = GridFitter(tol=args.grid_tol, min_holes=args.min_holes, board_size=args.board_size)
         self.stats = Stats()
         self.stats_c = Stats()          # same holes, centroid centers (rim refinement A/B)
+        self.stats_cb = Stats()         # counterbores on the board, keyed by grid position (i + 0.5, j + 0.5)
         self.K = self.D = None
         self.show_jitter, self.show_labels, self.show_thresh = False, False, False
         self.last = None
@@ -443,7 +530,14 @@ class BreadboardHoleTest:
             _, nn = cKDTree(raw).query(raw, k=min(7, len(raw)))
             med = np.median(sizes[nn[:, 1:]], axis=1)
             keep = (sizes > 0.75 * med) & (sizes < 1.33 * med)
+            # Counterbores (11.5 mm vs ~7 mm taps) come out ~1.6x their neighbors; the grid fit
+            # decides which of these are real (on a half-pitch point)
+            big = (sizes >= 1.33 * med) & (sizes < 2.2 * med)
+            cb_raw, cb_sizes = raw[big], sizes[big]
             raw, sizes, cen = raw[keep], sizes[keep], cen[keep]
+        else:
+            cb_raw, cb_sizes = np.zeros((0, 2)), np.zeros(0)
+        self.fitter.cb_pts = self.undistort(cb_raw)
         pts = self.undistort(raw)
         was_tracking = self.fitter.H is not None
         H, best = self.fitter.fit(pts)
@@ -456,6 +550,7 @@ class BreadboardHoleTest:
                 self.last_reseed_msg = now
             self.stats.reset()
             self.stats_c.reset()
+            self.stats_cb.reset()
         rms = None
         if H is not None:
             idx = np.array(list(best.keys()), dtype=np.float64)
@@ -464,8 +559,19 @@ class BreadboardHoleTest:
             rms = float(np.sqrt((err ** 2).sum(1).mean()))
             self.stats.update(best, pts, rms)
             self.stats_c.update(best, self.undistort(cen), rms)
+            self.stats_cb.update(self.board_counterbores(), self.fitter.cb_pts, rms)
         self.last = dict(raw=raw, sizes=sizes, H=H, best=best, rms=rms)
+        self.cb_draw = [(cb_raw[n], cb_sizes[n], n in set(self.board_counterbores().values()))
+                        for n in range(len(cb_raw))]
         return self.draw(bgr, gray, raw, sizes, H, best, rms)
+
+    def board_counterbores(self):
+        # This frame's counterbores inside the board window: {(i + 0.5, j + 0.5): blob}
+        w, b = self.fitter.window, self.args.board_size
+        if self.fitter.H is None or w is None or not b:
+            return {}
+        return {(k[0] + 0.5, k[1] + 0.5): n for k, n in self.fitter.cb.items()
+                if w[0] <= k[0] < w[0] + b - 1 and w[1] <= k[1] < w[1] + b - 1}
 
     def draw(self, bgr, gray, raw, sizes, H, best, rms):
         vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR) if self.show_thresh else bgr.copy()
@@ -476,6 +582,10 @@ class BreadboardHoleTest:
         for n, (p, s) in enumerate(zip(raw, sizes)):
             if n not in assigned:
                 cv2.circle(vis, tuple(np.round(p).astype(int)), int(s / 2) + 2, (255, 0, 255), 1)
+        # Counterbores: orange when on the board's half-pitch grid, magenta (outlier) otherwise
+        for p, s, on in getattr(self, 'cb_draw', []):
+            cv2.circle(vis, tuple(np.round(p).astype(int)), int(s / 2) + 3,
+                       (0, 165, 255) if on else (255, 0, 255), 3 if on else 1)
         if H is not None:
             keys = list(best.keys())
             gi = np.array(keys)
@@ -508,6 +618,8 @@ class BreadboardHoleTest:
             else f"blobs {len(raw)}  holes 0  (no grid fit)",
             f"frames {s['frames']}  holes seen {s['holes_seen']}  per-frame mean {s['holes_per_frame_mean']:.1f} min {s['holes_per_frame_min']}",
             f"det rate med {s['detection_rate_median']:.2f}  jitter med/p95 {jit} px",
+            f"counterbores {len(self.board_counterbores())}/5  board window from "
+            + (f"{self.fitter.window_cbs} counterbores" if self.fitter.window_cbs else "tap count (need 2+ counterbores)"),
         ]
         if len(sizes):
             pitch = f"  pitch {self.pitch_px(H):.1f}px" if H is not None else ""
@@ -534,6 +646,7 @@ class BreadboardHoleTest:
         if k == ord('r'):
             self.stats.reset()
             self.stats_c.reset()
+            self.stats_cb.reset()
             self.fitter.reset()
             print("stats reset, grid re-seeded")
         elif k == ord('j'):
@@ -556,7 +669,10 @@ class BreadboardHoleTest:
         # Averaged centers only, from holes seen in most frames (drops flickering edge holes)
         holes = [(k, self.stats.mean[k]) for k in self.stats.n
                  if self.stats.n[k] >= 0.5 * self.stats.frames]
-        return board_extrinsic(holes, self.K, self.fitter.H, self.fitter.window, self.args)
+        cbs = [(k, self.stats_cb.mean[k]) for k in self.stats_cb.n
+               if self.stats_cb.n[k] >= 0.5 * self.stats_cb.frames]
+        return board_extrinsic(holes + cbs, self.K, self.fitter.H, self.fitter.window, self.args,
+                               window_cbs=self.fitter.window_cbs)
 
     def save(self, vis):
         base = os.path.join(self.args.save_path, f"{timestamp()}_breadboard_holes")
@@ -565,9 +681,13 @@ class BreadboardHoleTest:
         for key in sorted(self.stats.n):
             holes.append({'index': list(map(int, key)), 'mean_px': self.stats.mean[key].tolist(),
                           'std_px': self.stats.std(key), 'detected': self.stats.n[key]})
+        # Counterbores have half-integer indices; --extrinsic-from takes them like taps
+        for key in sorted(self.stats_cb.n):
+            holes.append({'index': list(map(float, key)), 'mean_px': self.stats_cb.mean[key].tolist(),
+                          'std_px': self.stats_cb.std(key), 'detected': self.stats_cb.n[key]})
         out = {'summary': self.stats.summary(), 'pitch_mm': PITCH_MM,
                'H_grid_to_px': self.fitter.H.tolist() if self.fitter.H is not None else None,
-               'board_window': self.fitter.window,
+               'board_window': self.fitter.window, 'window_counterbores': self.fitter.window_cbs,
                'K': self.K.tolist() if self.K is not None else None,
                'D': self.D.tolist() if self.D is not None else None,
                'params': vars(self.args), 'holes': holes}
@@ -577,8 +697,9 @@ class BreadboardHoleTest:
         print(json.dumps(out['summary'], indent=2))
 
 
-def board_extrinsic(holes, K, H, window, args):
-    """holes: [(tracked (i, j), undistorted mean px)]. Prints + saves the camera pose in base;
+def board_extrinsic(holes, K, H, window, args, window_cbs=0):
+    """holes: [(tracked (i, j), undistorted mean px)], counterbores at (i + 0.5, j + 0.5).
+    window_cbs: counterbores that placed the window. Prints + saves the camera pose in base;
     returns the saved result (+ 'file': where), or None if it wasn't good enough to save."""
     b = args.board_size
     i0, j0 = window
@@ -588,10 +709,13 @@ def board_extrinsic(holes, K, H, window, args):
     if len(holes) < 20:
         print(f"only {len(holes)} board holes, not computing extrinsic")
         return None
-    # The window only equals the physical board if every edge row/column was seen; a fully
-    # hidden edge shifts every hole position by one pitch
-    for name, sel in (("i=0", gi[:, 0] == 0), (f"i={b-1}", gi[:, 0] == b - 1),
-                      ("j=0", gi[:, 1] == 0), (f"j={b-1}", gi[:, 1] == b - 1)):
+    n_cb = int(np.sum(np.any(gi % 1 != 0, axis=1)))
+    print(f"counterbores used: {n_cb}; board window placed by "
+          + (f"{window_cbs} counterbores" if window_cbs else "tap count"))
+    # Placed by tap count, the window only equals the physical board if every edge row/column
+    # was seen; a fully hidden edge shifts every hole position by one pitch
+    for name, sel in ([] if window_cbs else (("i=0", gi[:, 0] == 0), (f"i={b-1}", gi[:, 0] == b - 1),
+                      ("j=0", gi[:, 1] == 0), (f"j={b-1}", gi[:, 1] == b - 1))):
         if sel.sum() < 3:
             print(f"WARNING: board edge {name} has {sel.sum()} holes; board window may be off by one pitch")
 
@@ -637,7 +761,8 @@ def board_extrinsic(holes, K, H, window, args):
     # Same layout as handeye_calibration_record output, so handeye_touch_test can read it
     out = {'position': (t / 1000).tolist(), 'orientation': Rotation.from_matrix(R).as_quat().tolist(),
            'rpy': [Rotation.from_matrix(R).as_euler('xyz').tolist()],
-           'breadboard': {'reproj_rms_px': rms, 'holes': len(holes), 'tilt_deg': float(tilt),
+           'breadboard': {'reproj_rms_px': rms, 'holes': len(holes), 'counterbores': n_cb,
+                          'window_counterbores': window_cbs, 'tilt_deg': float(tilt),
                           'board_center_mm': list(args.board_center), 'board_z_mm': args.board_z,
                           'pitch_mm': PITCH_MM, 'K': K.tolist()}}
     path = os.path.join(args.data_save_path, 'eye_to_hand')
@@ -744,7 +869,7 @@ def main():
         holes = [(tuple(h['index']), np.array(h['mean_px'])) for h in snap['holes']
                  if h['detected'] >= 0.5 * frames]
         board_extrinsic(holes, np.array(snap['K']), np.array(snap['H_grid_to_px']),
-                        tuple(snap['board_window']), args)
+                        tuple(snap['board_window']), args, snap.get('window_counterbores', 0))
         return
 
     app = BreadboardHoleTest(args)

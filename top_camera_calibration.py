@@ -25,6 +25,7 @@
 #
 # Counterbores: the MB2424 also has five 11.5 mm counterbored mounting holes, at the center and
 # 11 pitches diagonally out from it, each in the middle of four taps (a half-pitch grid point).
+# Lit from above, mostly their through hole shows dark, so they are told apart by that position.
 # Their pattern fixes which tracked index is the board corner, so the board window stays right
 # when rows of taps are missed (e.g. dark near the arm base); two or more must agree, else the
 # window is the block holding the most taps. Their centers also go into the extrinsic.
@@ -47,6 +48,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 PITCH_MM = 25.4  # MB2424 hole pitch (1")
+CB_TOL = 0.2     # max distance of a counterbore from its half-pitch point, in pitches (taps sit 0.5 off)
 
 
 def counterbore_offsets(b):
@@ -219,16 +221,23 @@ class GridFitter:
         u = spacing * np.array([np.cos(theta), np.sin(theta)])
         v = spacing * np.array([-np.sin(theta), np.cos(theta)])
         A = np.column_stack([u, v])
-        # Seed at the blob nearest the centroid; affine labels are fine only close to it
-        c = pts[np.argmin(np.linalg.norm(pts - pts.mean(0), axis=1))]
-        near = np.linalg.norm(pts - c, axis=1) < 3.5 * spacing
-        g = np.linalg.solve(A, (pts[near] - c).T).T
-        gi = np.round(g)
-        ok = np.abs(g - gi).max(1) < self.tol
-        if ok.sum() < 4:
-            return None
-        H, _ = cv2.findHomography(gi[ok], pts[near][ok], 0)
-        return H
+        # Seed at a blob near the centroid; affine labels are fine only close to it. The blob
+        # nearest it can be off the tap grid (the center counterbore), so try the next ones too.
+        best = None                             # (fraction on the grid, H)
+        for n in np.argsort(np.linalg.norm(pts - pts.mean(0), axis=1))[:5]:
+            c = pts[n]
+            near = np.linalg.norm(pts - c, axis=1) < 3.5 * spacing
+            g = np.linalg.solve(A, (pts[near] - c).T).T
+            gi = np.round(g)
+            ok = np.abs(g - gi).max(1) < self.tol
+            if ok.sum() < 4:
+                continue
+            H, _ = cv2.findHomography(gi[ok], pts[near][ok], 0)
+            if ok.mean() >= 0.6:
+                return H
+            if best is None or ok.mean() > best[0]:
+                best = (ok.mean(), H)
+        return None if best is None else best[1]
 
     def assign(self, pts, H):
         # pixel -> grid through H^-1, round to the nearest hole, keep the close ones
@@ -260,7 +269,7 @@ class GridFitter:
         lo = np.floor(g).astype(int)
         res = np.abs(g - lo - 0.5).max(1)
         res = np.where(sane, res, np.inf)
-        for n in np.flatnonzero(res < self.tol):
+        for n in np.flatnonzero(res < CB_TOL):
             key = (lo[n, 0], lo[n, 1])
             if key not in self.cb or res[n] < res[self.cb[key]]:
                 self.cb[key] = n
@@ -530,10 +539,11 @@ class BreadboardHoleTest:
             _, nn = cKDTree(raw).query(raw, k=min(7, len(raw)))
             med = np.median(sizes[nn[:, 1:]], axis=1)
             keep = (sizes > 0.75 * med) & (sizes < 1.33 * med)
-            # Counterbores (11.5 mm vs ~7 mm taps) come out ~1.6x their neighbors; the grid fit
-            # decides which of these are real (on a half-pitch point)
-            big = (sizes >= 1.33 * med) & (sizes < 2.2 * med)
-            cb_raw, cb_sizes = raw[big], sizes[big]
+            # Counterbore candidates: under the top light usually only the through hole in the
+            # middle is dark, so most look like taps (some up to ~1.6x bigger). Only their place,
+            # a half-pitch grid point, sets them apart; the grid fit checks that.
+            cand = (sizes > 0.75 * med) & (sizes < 2.2 * med)
+            cb_raw, cb_sizes = raw[cand], sizes[cand]
             raw, sizes, cen = raw[keep], sizes[keep], cen[keep]
         else:
             cb_raw, cb_sizes = np.zeros((0, 2)), np.zeros(0)
@@ -561,8 +571,7 @@ class BreadboardHoleTest:
             self.stats_c.update(best, self.undistort(cen), rms)
             self.stats_cb.update(self.board_counterbores(), self.fitter.cb_pts, rms)
         self.last = dict(raw=raw, sizes=sizes, H=H, best=best, rms=rms)
-        self.cb_draw = [(cb_raw[n], cb_sizes[n], n in set(self.board_counterbores().values()))
-                        for n in range(len(cb_raw))]
+        self.cb_draw = [(cb_raw[n], cb_sizes[n]) for n in self.board_counterbores().values()]
         return self.draw(bgr, gray, raw, sizes, H, best, rms)
 
     def board_counterbores(self):
@@ -582,10 +591,9 @@ class BreadboardHoleTest:
         for n, (p, s) in enumerate(zip(raw, sizes)):
             if n not in assigned:
                 cv2.circle(vis, tuple(np.round(p).astype(int)), int(s / 2) + 2, (255, 0, 255), 1)
-        # Counterbores: orange when on the board's half-pitch grid, magenta (outlier) otherwise
-        for p, s, on in getattr(self, 'cb_draw', []):
-            cv2.circle(vis, tuple(np.round(p).astype(int)), int(s / 2) + 3,
-                       (0, 165, 255) if on else (255, 0, 255), 3 if on else 1)
+        # Counterbores found on the board's half-pitch points, in orange
+        for p, s in getattr(self, 'cb_draw', []):
+            cv2.circle(vis, tuple(np.round(p).astype(int)), int(s / 2) + 4, (0, 165, 255), 3)
         if H is not None:
             keys = list(best.keys())
             gi = np.array(keys)

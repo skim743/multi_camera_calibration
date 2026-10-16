@@ -37,14 +37,14 @@ The arm must be enabled, **out of** teaching mode, with the workspace clear.
    - the joints stay `--limit-margin` 5° inside the limits, with |j4| and |j6| ≤ `--wrist-range` 90° for the camera cable;
    - every link, the gripper tip and the camera stay `--clearance` 40 mm above the board;
    - the tag stays out of `--gripper-mask`, the part of the wrist image where the gripper fingers show (image fractions x0 y0 x1 y1, default `0.36 0.68 0.64 1.0`: bottom center, gripper half open). The window draws it in yellow; adjust it if the fingers show elsewhere, or `0 0 0 0` to turn it off.
-3. Views are visited most different first. Each move is a single target command at `--speed` 20%. The straight joint-space line to it is checked for clearance; a line that isn't clear goes through the start pose, and if that isn't clear either, the view is skipped.
+3. Views are visited most different first. Each move streams a target at 50 Hz that slides along the straight joint-space line, with a smooth start and stop and a peak of `--joint-speed` 20°/s on the joint that moves most. The target waits whenever the arm lags more than `--track-tol` 3°, so the arm stays on the line. (A single far target let the Piper take its own path, and that touched the board.) The line must stay `--transit-clearance` 80 mm above the board, easing to the views' own `--clearance` over the first and last quarter. A line that isn't clear goes through the start pose; if that isn't clear either, the view is skipped. `--speed` 50% is only the Piper's own cap.
 4. After the arm settles, it captures the tag and joints with the same checks as the manual step. Every `--refit-after` 4 views the planning mount is refitted and the remaining views are re-solved.
 5. From `--min-views` 8 on, it fits the mount and j1..j5 offsets after every view. It stops when the leave-one-out median is under `--target-loo-mm` 3.0 and the mount moved less than `--converge-mm` 0.5 / `--converge-deg` 0.1 since the previous fit, or at `--max-views` 20. A run that didn't converge isn't written to the static dir.
 6. The arm goes back to its start pose.
 
 Planning starts from a rough mount: `--mount-guess`, else the existing `wrist_calibration.json`, else `nominal_wrist_mount.json` (station 11's measured mount, the same mount design everywhere).
 
-Commands go to `--command-topic`, default `/joint_states`: `start_station_calibration.launch.py` remaps the Piper's input there, outside the station namespace. Each command sets all six joints by name, holds the gripper at its current opening (`position[6]`) and sets the speed (`velocity[6]`).
+Commands go to `--command-topic`, default `/joint_states`: `start_station_calibration.launch.py` remaps the Piper's input there, outside the station namespace. Each command sets all six joints by name, holds the gripper at its current opening (`position[6]`) and sets the Piper's speed cap (`velocity[6]`).
 
 ## Output
 

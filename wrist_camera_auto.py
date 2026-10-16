@@ -26,9 +26,12 @@
 # remaps the Piper's command input there, outside the station namespace). All six joints by name,
 # since the Piper node takes a missing joint as 0; position[6] holds the gripper where it is
 # (it is commanded on every message); velocity[6] is the speed in percent (the node runs at 100
-# without it). Each view is one target, re-sent at 10 Hz until the arm settles; the straight
-# joint-space line to it is checked for clearance (taken as the Piper's joint move path), and a
-# line that isn't clear goes through the pose the arm started in. q in the window or Ctrl-C stops
+# without it). A single far target let the Piper take its own path, which touched the board, so
+# each move streams a target at 50 Hz that slides along the straight joint-space line (smooth start
+# and stop, peak --joint-speed deg/s) and waits whenever the arm lags more than --track-tol: the arm
+# stays on the line, which is checked to keep --transit-clearance above the board (ramping from
+# the views' own --clearance at the ends). A line that isn't clear goes through the pose the arm
+# started in. q in the window or Ctrl-C stops
 # sending commands (the arm stays at its last command) and fits what was captured.
 #
 # Gripper in view: the fingers sit in a fixed part of the wrist image (same link as the camera),
@@ -87,14 +90,29 @@ def lowest_point(q, X):
     return min(z)
 
 
-def is_clear(q, X, args):
-    return lowest_point(q, X) >= args.board_z + args.clearance
+def is_clear(q, X, args, clearance=None):
+    return lowest_point(q, X) >= args.board_z + (args.clearance if clearance is None else clearance)
 
 
 def path_clear(qa, qb, X, args):
-    # The straight joint-space line, checked every 2 deg of the largest joint motion
+    """The straight joint-space line, every 2 deg of the largest joint motion: --transit-clearance
+    above the board, ramping down to --clearance over the first and last quarter (the views sit lower)."""
     n = max(2, int(np.ceil(np.degrees(np.abs(qb - qa).max()) / 2.0)) + 1)
-    return all(is_clear(qa + s * (qb - qa), X, args) for s in np.linspace(0, 1, n))
+    c0, c1 = args.clearance, max(args.clearance, args.transit_clearance)
+    return all(is_clear(qa + s * (qb - qa), X, args, c0 + (c1 - c0) * min(1.0, 4 * s, 4 * (1 - s)))
+               for s in np.linspace(0, 1, n))
+
+
+def stream_profile(q_start, q_goal, joint_speed_deg):
+    """Duration (s) and position along the straight joint-space line at path time t: smoothstep,
+    so speed is 0 at both ends and peaks at joint_speed_deg (deg/s) on the joint that moves most."""
+    dq = q_goal - q_start
+    T = max(0.5, 1.5 * np.degrees(np.abs(dq).max()) / joint_speed_deg)
+
+    def at(t):
+        u = min(max(t / T, 0.0), 1.0)
+        return q_start + dq * (3 * u * u - 2 * u ** 3)
+    return T, at
 
 
 def limits(args):
@@ -498,19 +516,27 @@ class RosRig:
         self.pub.publish(m)
 
     def move(self, q_target):
-        """One target, re-sent at 10 Hz; True once every joint has stayed within --joint-tol of
-        it for --settle s, False after --move-timeout."""
+        """Stream a target sliding along the straight joint-space line to q_target (stream_profile);
+        path time only advances while the arm is within --track-tol of the target, so the arm can't
+        fall behind and cut a corner. True once every joint has stayed within --joint-tol of
+        q_target for --settle s, False after the profile time + --move-timeout."""
         a = self.args
-        t0, sent, reached_at = time.time(), 0.0, None
+        T, at = stream_profile(self.joints(), q_target, a.joint_speed)
+        t0 = last = time.time()
+        s, sent, reached_at = 0.0, 0.0, None
         while True:
             now = time.time()
-            if now - t0 > a.move_timeout:
+            if now - t0 > T + a.move_timeout:
                 return False
-            if now - sent >= 0.1:
-                self.send(q_target)
+            target = at(s)
+            if np.abs(self.st['q'] - target).max() < np.radians(a.track_tol):
+                s += now - last
+            last = now
+            if now - sent >= 0.02:
+                self.send(target)
                 sent = now
             self.spin()
-            if np.abs(self.st['q'] - q_target).max() < np.radians(a.joint_tol):
+            if s >= T and np.abs(self.st['q'] - q_target).max() < np.radians(a.joint_tol):
                 reached_at = reached_at or now
                 if now - reached_at >= a.settle:
                     return True
@@ -540,14 +566,18 @@ def add_auto_args(ap):
     ap.add_argument('--mount-guess', help="wrist calibration json for planning (default: the existing "
                     "wrist_calibration.json, else nominal_wrist_mount.json)")
     ap.add_argument('--command-topic', default='/joint_states', help="Piper joint command topic")
-    ap.add_argument('--speed', type=int, default=20, help="Piper speed, percent")
+    ap.add_argument('--speed', type=int, default=50,
+                    help="Piper speed, percent: only a cap, the streamed target sets the pace")
+    ap.add_argument('--joint-speed', type=float, default=20.0, help="deg/s peak of the streamed target")
+    ap.add_argument('--track-tol', type=float, default=3.0, help="deg; the target waits while the arm lags more")
     ap.add_argument('--joint-tol', type=float, default=0.3, help="deg: arrived when every joint is this close")
     ap.add_argument('--settle', type=float, default=1.0, help="s at the target before capturing")
     ap.add_argument('--steady-deg', type=float, default=0.2,
                     help="max joint motion during a capture (motor-held, so looser than manual --max-joint-motion)")
     ap.add_argument('--capture-tries', type=int, default=3, help="captures per view before giving up on steadiness")
-    ap.add_argument('--move-timeout', type=float, default=60.0, help="s per move")
+    ap.add_argument('--move-timeout', type=float, default=30.0, help="s per move on top of its planned time")
     ap.add_argument('--clearance', type=float, default=40.0, help="mm above the board for links, gripper tip and camera")
+    ap.add_argument('--transit-clearance', type=float, default=80.0, help="mm above the board between views")
     ap.add_argument('--limit-margin', type=float, default=5.0, help="deg inside the joint limits")
     ap.add_argument('--wrist-range', type=float, default=90.0, help="deg; |j4| and |j6| limit (camera cable)")
     ap.add_argument('--view-tilt', type=float, nargs='+', default=[20.0, 35.0, 50.0], help="deg from straight down")

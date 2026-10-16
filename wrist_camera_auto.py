@@ -6,8 +6,9 @@
 # by hand; multi_camera_calibration.py runs it as the wrist step (--wrist-mode auto, the default).
 #
 # Views: camera positions on a cap above the tag (--view-tilt deg from straight down at
-# --view-dist mm), aimed near the tag, each solved by IK on the same FK as the fit from a few
-# wrist seeds, so the rotation about the view axis varies too. A view is kept if the whole tag
+# --view-dist mm), turned so the tag center lands near --tag-pixel (above the gripper), each solved
+# by IK on the same FK as the fit from a few wrist seeds, so the rotation about the ray to the tag
+# varies too. A view is kept if the whole tag
 # lands inside the image, the joints stay inside the limits, and every link, the gripper tip and
 # the camera stay --clearance mm above the board. Kept views are visited most different first
 # (farthest point in joint space), so the first ones already pin the fit down.
@@ -25,10 +26,14 @@
 # remaps the Piper's command input there, outside the station namespace). All six joints by name,
 # since the Piper node takes a missing joint as 0; position[6] holds the gripper where it is
 # (it is commanded on every message); velocity[6] is the speed in percent (the node runs at 100
-# without it). Moves are cut into waypoints of at most --step-deg per joint, so the arm follows
-# the straight joint-space line that was checked for clearance instead of each joint finishing on
-# its own; a line that isn't clear goes through the pose the arm started in. q in the window or
-# Ctrl-C stops sending commands (the arm stays at its last command) and fits what was captured.
+# without it). Each view is one target, re-sent at 10 Hz until the arm settles; the straight
+# joint-space line to it is checked for clearance (taken as the Piper's joint move path), and a
+# line that isn't clear goes through the pose the arm started in. q in the window or Ctrl-C stops
+# sending commands (the arm stays at its last command) and fits what was captured.
+#
+# Gripper in view: the fingers sit in a fixed part of the wrist image (same link as the camera),
+# --gripper-mask as image fractions (x0 y0 x1 y1); views whose tag would overlap it aren't planned.
+# The default fits a half-open gripper at the bottom center; the window draws it to check.
 
 import json
 import os
@@ -50,7 +55,8 @@ JOINT_LIMITS = np.array([(-2.6179, 2.6179), (0.0, 3.14), (-2.967, 0.0),
                          (-1.745, 1.745), (-1.22, 1.22), (-2.09439, 2.09439)])
 JOINT_NAMES = [f'joint{k}' for k in range(1, 7)]
 TOOL_MM = 120.0      # flange -> gripper tip along the flange z (piper_kinematics.py's d6 extension)
-ROT_MM = 200.0       # 1 rad of view-axis error weighs like 200 mm in the IK
+ROT_MM = 200.0       # 1 rad of ray error weighs like 200 mm in the IK
+POS_W = 0.05         # weight of the camera position in the IK: a wish, the ray is the constraint
 
 
 class Abort(Exception):
@@ -100,22 +106,31 @@ def limits(args):
     return lo, hi
 
 
-def ik_view(cam_p, z_t, seeds, X, lo, hi):
-    """Joints putting the camera at cam_p (mm) looking along z_t, any rotation about the view
-    axis; one solution per seed that converges (within 0.5 mm / 0.2 deg)."""
+def ik_view(cam_p, target, ray_c, seeds, X, lo, hi):
+    """Joints with the base point target on the camera ray ray_c (unit, camera frame: where in the
+    image it lands), the camera as close to cam_p (mm) as the arm allows, any rotation about that
+    ray. One solution per seed whose ray is within 0.2 deg; the caller checks where it ended up."""
     def res(q):
         T = fk(q[None])[0] @ X
-        return np.r_[T[:3, 3] - cam_p, (T[:3, 2] - z_t) * ROT_MM]
+        r = T[:3, :3].T @ (target - T[:3, 3])
+        return np.r_[(T[:3, 3] - cam_p) * POS_W, (r / np.linalg.norm(r) - ray_c) * ROT_MM]
     out = []
     for s in seeds:
-        sol = least_squares(res, np.clip(s, lo + 1e-6, hi - 1e-6), bounds=(lo, hi), max_nfev=60)
-        if np.linalg.norm(sol.fun[:3]) < 0.5 and np.linalg.norm(sol.fun[3:]) / ROT_MM < np.radians(0.2):
+        sol = least_squares(res, np.clip(s, lo + 1e-6, hi - 1e-6), bounds=(lo, hi), max_nfev=80)
+        if np.linalg.norm(sol.fun[3:]) / ROT_MM < np.radians(0.2):
             out.append(sol.x)
     return out
 
 
-def tag_in_image(T_base_cam, T_base_tag, K, size_mm, wh, margin):
-    """The whole tag inside the image (margin px from the edges) and at least 40 px across."""
+def view_geometry(T_base_cam, p):
+    """Camera to tag distance (mm) and tilt of that line from straight down (deg)."""
+    d = T_base_cam[:3, 3] - p
+    return np.linalg.norm(d), np.degrees(np.arccos(np.clip(d[2] / np.linalg.norm(d), -1, 1)))
+
+
+def tag_in_image(T_base_cam, T_base_tag, K, size_mm, wh, margin, mask=None):
+    """The whole tag inside the image (margin px from the edges), at least 40 px across, and
+    clear of mask (x0, y0, x1, y1 as image fractions: where the gripper shows)."""
     h = size_mm / 2
     c = np.array([[-h, h, 0, 1], [h, h, 0, 1], [h, -h, 0, 1], [-h, -h, 0, 1]]).T
     Pc = (inv_T(T_base_cam) @ T_base_tag @ c)[:3].T
@@ -123,14 +138,21 @@ def tag_in_image(T_base_cam, T_base_tag, K, size_mm, wh, margin):
         return False
     uv = Pc[:, :2] / Pc[:, 2:] * [K[0, 0], K[1, 1]] + K[:2, 2]
     inside = (uv > margin).all() and (uv[:, 0] < wh[0] - margin).all() and (uv[:, 1] < wh[1] - margin).all()
+    if mask is not None and mask[2] > mask[0] and mask[3] > mask[1]:
+        # Tag bounding box vs the mask, both grown by half the margin
+        m = margin / 2
+        x0, y0, x1, y1 = mask[0] * wh[0] - m, mask[1] * wh[1] - m, mask[2] * wh[0] + m, mask[3] * wh[1] + m
+        if not (uv[:, 0].max() < x0 or uv[:, 0].min() > x1 or uv[:, 1].max() < y0 or uv[:, 1].min() > y1):
+            return False
     return bool(inside and np.linalg.norm(uv[0] - uv[2]) > 40 * np.sqrt(2))
 
 
 def plan_views(T_base_tag, X, K, wh, q0, args, log=print):
-    """Candidate views: [{'cam_p', 'z', 'q'}], most different first (farthest point in joint space)."""
+    """Candidate views: [{'cam_p', 'ray', 'q'}], most different first (farthest point in joint space)."""
     lo, hi = limits(args)
     p = T_base_tag[:3, 3]
     rng = np.random.default_rng(0)
+    w, h = wh
     # Seeds: where the arm is, plus wrist variations of it, so solutions differ in camera roll
     seeds0 = [q0] + [np.r_[q0[:3], j4, q0[4], j6] for j4 in (-0.8, 0.0, 0.8) for j6 in (-1.2, 0.0, 1.2)]
     cands = []
@@ -139,17 +161,24 @@ def plan_views(T_base_tag, X, K, wh, q0, args, log=print):
         for az in np.radians(np.arange(0.0, 360.0, 360.0 / args.view_azimuths)):
             for dist in args.view_dist:
                 cam_p = p + dist * np.array([np.sin(tilt) * np.cos(az), np.sin(tilt) * np.sin(az), np.cos(tilt)])
-                aim = p + np.r_[rng.uniform(-args.aim_jitter, args.aim_jitter, 2), 0.0]
-                z_t = (aim - cam_p) / np.linalg.norm(aim - cam_p)
+                # Where the tag center should land: --tag-pixel (above the gripper), jittered
+                uv = np.array(args.tag_pixel) * wh + rng.uniform(-1, 1, 2) * [args.pixel_jitter, args.pixel_jitter / 2]
+                ray = np.r_[(uv - K[:2, 2]) / [K[0, 0], K[1, 1]], 1.0]
+                ray /= np.linalg.norm(ray)
                 seeds = [c['q'] for c in cands[-3:]] + seeds0
                 kept = []
-                for q in ik_view(cam_p, z_t, seeds, X, lo, hi):
+                for q in ik_view(cam_p, p, ray, seeds, X, lo, hi):
                     if any(np.abs(q - k).max() < np.radians(15) for k in kept):
                         continue                                    # same solution again
                     T = fk(q[None])[0] @ X
-                    if tag_in_image(T, T_base_tag, K, args.marker_size, wh, args.image_margin) and is_clear(q, X, args):
+                    dist_q, tilt_q = view_geometry(T, p)
+                    if not (min(args.view_dist) * 0.85 <= dist_q <= max(args.view_dist) * 1.15
+                            and tilt_q <= max(args.view_tilt) + 10):
+                        continue                                    # pushed too far from the wish
+                    if (tag_in_image(T, T_base_tag, K, args.marker_size, wh, args.image_margin, args.gripper_mask)
+                            and is_clear(q, X, args)):
                         kept.append(q)
-                cands += [{'cam_p': cam_p, 'z': z_t, 'q': q} for q in kept]
+                cands += [{'cam_p': cam_p, 'ray': ray, 'q': q} for q in kept]
     log(f"planned {len(cands)} reachable views in {time.time() - t0:.1f} s")
     if not cands:
         return []
@@ -164,11 +193,11 @@ def plan_views(T_base_tag, X, K, wh, q0, args, log=print):
     return [cands[k] for k in order]
 
 
-def resolve(view, X, args):
+def resolve(view, X, T_base_tag, args):
     """Re-solve a planned view with a new mount estimate, near its old joints; None if lost."""
     lo, hi = limits(args)
-    sols = ik_view(view['cam_p'], view['z'], [view['q']], X, lo, hi)
-    if not sols or not is_clear(sols[0], X, args):
+    sols = ik_view(view['cam_p'], T_base_tag[:3, 3], view['ray'], [view['q']], X, lo, hi)
+    if not sols or not is_clear(sols[0], X, args) or np.abs(sols[0] - view['q']).max() > np.radians(20):
         return None
     return dict(view, q=sols[0])
 
@@ -272,7 +301,7 @@ def run_auto(args, rig, X0, log=print):
                 # Better mount for planning (nominal FK, like the plan), then re-solve what's left
                 q, Ts = view_data(views, ratio)
                 X = fit_views(q, Ts, T_base_tag)[0]
-                plan = [r for r in (resolve(w, X, args) for w in plan) if r is not None]
+                plan = [r for r in (resolve(w, X, T_base_tag, args) for w in plan) if r is not None]
                 log(f"  mount refit from {n} views: t {np.round(X[:3, 3], 1).tolist()} mm; {len(plan)} views left")
             if n >= args.min_views:
                 fit_X, _, loo, stuck = full_fit(views, T_base_tag, ratio, args)
@@ -402,6 +431,10 @@ class RosRig:
                 return
         _, _, c, im = self.seen['wrist']
         vis = im.copy()
+        h, w = vis.shape[:2]
+        x0, y0, x1, y1 = self.args.gripper_mask
+        if x1 > x0 and y1 > y0:
+            cv2.rectangle(vis, (int(x0 * w), int(y0 * h)), (int(x1 * w) - 1, int(y1 * h) - 1), (0, 255, 255), 1)
         if c is not None:
             cv2.polylines(vis, [np.round(c).astype(np.int32)], True, (0, 255, 0), 2)
         lines = self.status[-3:] + ["[q stop]"]
@@ -455,33 +488,24 @@ class RosRig:
         self.pub.publish(m)
 
     def move(self, q_target):
-        """Through waypoints of at most --step-deg per joint; True once settled at q_target."""
+        """One target, re-sent at 10 Hz; True once every joint has stayed within --joint-tol of
+        it for --settle s, False after --move-timeout."""
         a = self.args
-        q_start = self.joints()
-        n = max(1, int(np.ceil(np.degrees(np.abs(q_target - q_start).max()) / a.step_deg)))
-        t0 = time.time()
-        for k in range(1, n + 1):
-            wp = q_start + (q_target - q_start) * k / n
-            last = k == n
-            tol = np.radians(a.joint_tol if last else a.step_deg)
-            reached_at, sent = None, 0.0
-            while True:
-                now = time.time()
-                if now - t0 > a.move_timeout:
-                    return False
-                if now - sent >= 0.1:
-                    self.send(wp)
-                    sent = now
-                self.spin()
-                err = np.abs(self.st['q'] - wp).max()
-                if err < tol:
-                    if not last:
-                        break
-                    reached_at = reached_at or now
-                    if now - reached_at >= a.settle:
-                        return True
-                else:
-                    reached_at = None
+        t0, sent, reached_at = time.time(), 0.0, None
+        while True:
+            now = time.time()
+            if now - t0 > a.move_timeout:
+                return False
+            if now - sent >= 0.1:
+                self.send(q_target)
+                sent = now
+            self.spin()
+            if np.abs(self.st['q'] - q_target).max() < np.radians(a.joint_tol):
+                reached_at = reached_at or now
+                if now - reached_at >= a.settle:
+                    return True
+            else:
+                reached_at = None
 
     def capture(self, n):
         self.st['cap'] = []
@@ -507,7 +531,6 @@ def add_auto_args(ap):
                     "wrist_calibration.json, else nominal_wrist_mount.json)")
     ap.add_argument('--command-topic', default='/joint_states', help="Piper joint command topic")
     ap.add_argument('--speed', type=int, default=20, help="Piper speed, percent")
-    ap.add_argument('--step-deg', type=float, default=5.0, help="max joint change per waypoint")
     ap.add_argument('--joint-tol', type=float, default=0.3, help="deg: arrived when every joint is this close")
     ap.add_argument('--settle', type=float, default=1.0, help="s at the target before capturing")
     ap.add_argument('--move-timeout', type=float, default=60.0, help="s per move")
@@ -517,8 +540,13 @@ def add_auto_args(ap):
     ap.add_argument('--view-tilt', type=float, nargs='+', default=[20.0, 35.0, 50.0], help="deg from straight down")
     ap.add_argument('--view-dist', type=float, nargs='+', default=[250.0, 330.0, 410.0], help="camera to tag, mm")
     ap.add_argument('--view-azimuths', type=int, default=8, help="directions around the tag")
-    ap.add_argument('--aim-jitter', type=float, default=30.0, help="mm; views aim this far around the tag center")
+    ap.add_argument('--tag-pixel', type=float, nargs=2, default=[0.5, 0.35], metavar=('U', 'V'),
+                    help="where the tag center should land in the wrist image, image fractions")
+    ap.add_argument('--pixel-jitter', type=float, default=80.0, help="px around --tag-pixel (half that vertically)")
     ap.add_argument('--image-margin', type=float, default=60.0, help="px; the tag must be this far inside the image")
+    ap.add_argument('--gripper-mask', type=float, nargs=4, default=[0.36, 0.68, 0.64, 1.0],
+                    metavar=('X0', 'Y0', 'X1', 'Y1'),
+                    help="where the gripper shows in the wrist image, image fractions; 0 0 0 0 = none")
     ap.add_argument('--min-views', type=int, default=8)
     ap.add_argument('--max-views', type=int, default=20)
     ap.add_argument('--refit-after', type=int, default=4, help="refit the planning mount every this many views")

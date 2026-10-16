@@ -31,11 +31,13 @@ python3 multi_camera_calibration.py --cameras wrist   # wrist only, with the sav
 The arm must be enabled, **out of** teaching mode, with the workspace clear.
 
 1. The top camera measures the tag's pose on the board.
-2. Views are planned on a cap above the tag (`--view-tilt` 20/35/50° from straight down, `--view-dist` 250/330/410 mm, `--view-azimuths` 8 directions), solved by IK on the same kinematics as the fit. A view is kept only if:
+2. Views are planned on a cap above the tag (`--view-tilt` 20/35/50° from straight down, `--view-dist` 250/330/410 mm, `--view-azimuths` 8 directions), solved by IK on the same kinematics as the fit. The IK keeps the tag center exactly at `--tag-pixel` (default 50% across, 35% down: above the gripper, ±`--pixel-jitter` px), and gets the camera as close to the planned position as the arm can reach. A view is kept only if:
+   - it ends up within 15% of the distance range and 10° of the tilt range;
    - the whole tag is inside the image;
    - the joints stay `--limit-margin` 5° inside the limits, with |j4| and |j6| ≤ `--wrist-range` 90° for the camera cable;
-   - every link, the gripper tip and the camera stay `--clearance` 40 mm above the board.
-3. Views are visited most different first. Each move goes through waypoints of at most `--step-deg` 5° per joint along the checked straight joint-space line, at `--speed` 20%. A line that isn't clear goes through the start pose; if that isn't clear either, the view is skipped.
+   - every link, the gripper tip and the camera stay `--clearance` 40 mm above the board;
+   - the tag stays out of `--gripper-mask`, the part of the wrist image where the gripper fingers show (image fractions x0 y0 x1 y1, default `0.36 0.68 0.64 1.0`: bottom center, gripper half open). The window draws it in yellow; adjust it if the fingers show elsewhere, or `0 0 0 0` to turn it off.
+3. Views are visited most different first. Each move is a single target command at `--speed` 20%. The straight joint-space line to it is checked for clearance; a line that isn't clear goes through the start pose, and if that isn't clear either, the view is skipped.
 4. After the arm settles, it captures the tag and joints with the same checks as the manual step. Every `--refit-after` 4 views the planning mount is refitted and the remaining views are re-solved.
 5. From `--min-views` 8 on, it fits the mount and j1..j5 offsets after every view. It stops when the leave-one-out median is under `--target-loo-mm` 3.0 and the mount moved less than `--converge-mm` 0.5 / `--converge-deg` 0.1 since the previous fit, or at `--max-views` 20. A run that didn't converge isn't written to the static dir.
 6. The arm goes back to its start pose.

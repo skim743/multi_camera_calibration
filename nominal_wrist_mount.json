@@ -1,0 +1,6 @@
+{
+  "note": "Starting guess for planning the automated wrist calibration (wrist_camera_auto.py), not a calibration. Mean of two station 11 tag calibrations of the same mount design (2026-10-15 12:05:26 and 12:13:48, 8 views each, leave-one-out 2.6-2.8 mm); the 19.7 deg roll matches the 20.6 deg camera face in piper_realsense_mount_435i.STEP.",
+  "frame": "camera pose in the flange (end_pose) frame",
+  "position": [-0.0730, 0.00555, 0.0410],
+  "rpy_deg": [-19.67, 1.66, -91.05]
+}

@@ -22,7 +22,27 @@ python3 multi_camera_calibration.py --cameras wrist   # wrist only, with the sav
 1. If `top_calibration.json` or `wrist_calibration.json` already exists in the static dir (only the ones being calibrated are checked), it asks to overwrite or cancel before anything starts.
 2. Top camera: the board must be clear of everything, tag included. When the hole count and jitter settle, press `e`. A fit over `--max-extrinsic-rms` is refused (`r` resets, then `e` again). `q` aborts.
    The board's 5 counterbored mounting holes (11.5 mm: center, and 11 pitches diagonally out from it) are circled orange. When 2 or more are found, they decide which detected hole is which. This keeps the board placement right when rows of holes are missed, e.g. dark near the arm base. They are also used in the pose solve. With fewer than 2, the window is the 24×24 block holding the most holes, as before, and the status line says so.
-3. Wrist camera: place the tag on the board, press Enter in the terminal, then pose the arm in teaching mode and capture views in the window (~10: varied heights, tilts, wrist angles). Keys: `Enter` capture, `d` undo, `t` re-measure the tag, `q` fit and finish. `--marker-size` must be the measured black-square side of the printed tag.
+3. Wrist camera: place the tag on the board and press Enter in the terminal. `--marker-size` must be the measured black-square side of the printed tag.
+   - **Automated (default, `--wrist-mode auto`):** see below. It asks once before the first move; `q` in the window or Ctrl-C stops it, and it fits what was captured.
+   - **Manual (`--wrist-mode manual`):** pose the arm in teaching mode and capture views in the window (~10: varied heights, tilts, wrist angles). Keys: `Enter` capture, `d` undo, `t` re-measure the tag, `q` fit and finish.
+
+### Automated wrist step (`wrist_camera_auto.py`)
+
+The arm must be enabled, **out of** teaching mode, with the workspace clear.
+
+1. The top camera measures the tag's pose on the board.
+2. Views are planned on a cap above the tag (`--view-tilt` 20/35/50° from straight down, `--view-dist` 250/330/410 mm, `--view-azimuths` 8 directions), solved by IK on the same kinematics as the fit. A view is kept only if:
+   - the whole tag is inside the image;
+   - the joints stay `--limit-margin` 5° inside the limits, with |j4| and |j6| ≤ `--wrist-range` 90° for the camera cable;
+   - every link, the gripper tip and the camera stay `--clearance` 40 mm above the board.
+3. Views are visited most different first. Each move goes through waypoints of at most `--step-deg` 5° per joint along the checked straight joint-space line, at `--speed` 20%. A line that isn't clear goes through the start pose; if that isn't clear either, the view is skipped.
+4. After the arm settles, it captures the tag and joints with the same checks as the manual step. Every `--refit-after` 4 views the planning mount is refitted and the remaining views are re-solved.
+5. From `--min-views` 8 on, it fits the mount and j1..j5 offsets after every view. It stops when the leave-one-out median is under `--target-loo-mm` 3.0 and the mount moved less than `--converge-mm` 0.5 / `--converge-deg` 0.1 since the previous fit, or at `--max-views` 20. A run that didn't converge isn't written to the static dir.
+6. The arm goes back to its start pose.
+
+Planning starts from a rough mount: `--mount-guess`, else the existing `wrist_calibration.json`, else `nominal_wrist_mount.json` (station 11's measured mount, the same mount design everywhere).
+
+Commands go to `--command-topic`, default `/joint_states`: `start_station_calibration.launch.py` remaps the Piper's input there, outside the station namespace. Each command sets all six joints by name, holds the gripper at its current opening (`position[6]`) and sets the speed (`velocity[6]`).
 
 ## Output
 
@@ -40,5 +60,7 @@ The station number comes from the hostname (`robotics-education-labN`), as in th
 | `multi_camera_calibration.py` | entry point: top step, then wrist step |
 | `top_camera_calibration.py` | hole detection, grid fit, top camera extrinsic; also runs standalone |
 | `wrist_camera_calibration.py` | tag capture and wrist camera fit; also runs standalone (`run`, `fit`) |
+| `wrist_camera_auto.py` | automated wrist step: view planning, IK, motion, stop rule |
+| `nominal_wrist_mount.json` | starting mount guess for planning |
 | `breadboard_model.py` | Piper forward kinematics shared by the fits |
 | `joint_offset_fit.py` | Piper DH table (and an offline joint-offset fit) |

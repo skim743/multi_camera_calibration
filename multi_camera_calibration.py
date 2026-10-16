@@ -12,9 +12,11 @@
 # 1. Top: the board must be clear of everything (tag included). The window shows the hole fit;
 #    once the hole count and jitter settle, press e. A fit over --max-extrinsic-rms is refused
 #    (r resets the stats, then e again). q aborts.
-# 2. Wrist: place the tag on the board, press Enter in the terminal, then capture views as in
-#    wrist_camera_calibration.py run (window keys: Enter capture, d undo, t re-measure the tag,
-#    q fit + finish).
+# 2. Wrist: place the tag on the board, press Enter in the terminal. Default (--wrist-mode auto):
+#    the arm visits planned views of the tag by itself until the fit converges (wrist_camera_auto.py;
+#    asks before the first move; q in the window stops). --wrist-mode manual: teach the views in
+#    teaching mode as in wrist_camera_calibration.py run (Enter capture, d undo, t re-measure the
+#    tag, q fit + finish).
 #
 # Results: <static-dir>/top_calibration.json and wrist_calibration.json, with the time they were
 # made inside ('timestamp'). Existing ones are only replaced after a prompt at the start. The
@@ -38,6 +40,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from top_camera_calibration import BreadboardHoleTest, add_board_args, to_bgr
 from wrist_camera_calibration import add_run_args, cmd_run, load_top_calibration, pose_to_T
+import wrist_camera_auto
 
 STATIC_FILES = {'top': 'top_calibration.json', 'wrist': 'wrist_calibration.json'}
 
@@ -174,6 +177,9 @@ def main():
     add_board_args(ap)
     ap.add_argument('--save-path', default='./data/breadboard', help="hole snapshots (s key)")
     add_run_args(ap)
+    ap.add_argument('--wrist-mode', choices=['auto', 'manual'], default='auto',
+                    help="auto: the arm moves through planned views; manual: teach them by hand")
+    wrist_camera_auto.add_auto_args(ap)
     # Topics default to the station launch's, filled in from --station-id
     ap.set_defaults(top_topic=None, top_info=None, wrist_topic=None, wrist_info=None, joint_topic=None)
     args = ap.parse_args()
@@ -182,6 +188,12 @@ def main():
     print(f"station {args.station_id} (ROS_DOMAIN_ID {os.environ.get('ROS_DOMAIN_ID', 'unset')}), "
           f"calibrating: {', '.join(cams)}")
     confirm_overwrite(args, cams)
+    if 'wrist' in cams and args.wrist_mode == 'auto':
+        # Read the planning mount now: wrist_calibration.json may be replaced by this run
+        guess = args.mount_guess or (static_path(args, 'wrist') if os.path.exists(static_path(args, 'wrist'))
+                                     else wrist_camera_auto.NOMINAL_MOUNT)
+        X_guess = wrist_camera_auto.load_mount(guess)
+        print(f"planning mount guess: {guess}")
 
     if 'top' in cams:
         top = calibrate_top(args)
@@ -202,9 +214,17 @@ def main():
                   f"top camera sees it, then press Enter... ")
         except EOFError:
             raise SystemExit("no terminal input; wrist camera not calibrated")
-        wrist = cmd_run(args, T_base_top)
+        if args.wrist_mode == 'auto':
+            rig = wrist_camera_auto.RosRig(args, T_base_top)
+            wrist = wrist_camera_auto.run_auto(args, rig, X_guess, log=rig.log)
+        else:
+            wrist = cmd_run(args, T_base_top)
         if wrist is None:
-            raise SystemExit("no wrist views, wrist_calibration.json not written")
+            raise SystemExit("not enough wrist views, wrist_calibration.json not written")
+        if not wrist.get('auto', {}).get('converged', True):
+            raise SystemExit(f"automated wrist calibration ended '{wrist['auto']['end']}' without converging, "
+                             f"wrist_calibration.json not written (result kept at {wrist['file']}); "
+                             f"--target-loo-mm or --max-views to loosen")
         if wrist['joint_offsets_at_bound']:
             raise SystemExit(f"joint offsets {wrist['joint_offsets_at_bound']} hit the bound, wrist_calibration.json "
                              f"not written (result kept at {wrist['file']})")

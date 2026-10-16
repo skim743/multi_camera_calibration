@@ -280,13 +280,22 @@ def run_auto(args, rig, X0, log=print):
                 q_now = rig.joints()
                 continue
             q_now = rig.joints()
-            tags, js = rig.capture(args.frames)
-            js = np.array(js)
+            # Held by the motors the joints dither a little, so a capture that isn't steady is
+            # retried (the arm keeps settling) before the view is given up
+            for attempt in range(1, args.capture_tries + 1):
+                tags, js = rig.capture(args.frames)
+                js = np.array(js)
+                motion = np.degrees(np.ptp(js, axis=0)) if len(js) else np.full(6, np.inf)
+                steady = len(js) >= 5 and motion.max() <= args.steady_deg
+                if steady or len(tags) < max(5, args.frames // 2):
+                    break
+                log(f"  joints moved {motion.max():.3f} deg (j{int(np.argmax(motion)) + 1}) over {len(js)} joint "
+                    f"messages during capture {attempt}/{args.capture_tries} (limit {args.steady_deg})")
             if len(tags) < max(5, args.frames // 2):
                 log(f"  tag not seen ({len(tags)} detections), skipped")
                 continue
-            if len(js) < 5 or np.degrees(np.ptp(js, axis=0)).max() > args.max_joint_motion:
-                log("  joints not steady during the capture, skipped")
+            if not steady:
+                log(f"  joints not steady ({len(js)} joint messages, max motion {motion.max():.3f} deg), skipped")
                 continue
             T_m, dt, dr = average_T(tags)
             if dr.max() > args.max_tag_jitter:
@@ -294,7 +303,8 @@ def run_auto(args, rig, X0, log=print):
                 continue
             views.append({'joints': js.mean(0).tolist(), 'T_cam_tag_mm': T_m.tolist(), 'tag_frames': len(tags),
                           'tag_spread_mm': float(dt.max()), 'tag_spread_deg': float(dr.max()),
-                          'joint_msgs': int(len(js)), 'planned_joints': v['q'].tolist()})
+                          'joint_msgs': int(len(js)), 'joint_motion_deg': motion.tolist(),
+                          'planned_joints': v['q'].tolist()})
             save()
             n = len(views)
             if n % args.refit_after == 0:
@@ -533,6 +543,9 @@ def add_auto_args(ap):
     ap.add_argument('--speed', type=int, default=20, help="Piper speed, percent")
     ap.add_argument('--joint-tol', type=float, default=0.3, help="deg: arrived when every joint is this close")
     ap.add_argument('--settle', type=float, default=1.0, help="s at the target before capturing")
+    ap.add_argument('--steady-deg', type=float, default=0.2,
+                    help="max joint motion during a capture (motor-held, so looser than manual --max-joint-motion)")
+    ap.add_argument('--capture-tries', type=int, default=3, help="captures per view before giving up on steadiness")
     ap.add_argument('--move-timeout', type=float, default=60.0, help="s per move")
     ap.add_argument('--clearance', type=float, default=40.0, help="mm above the board for links, gripper tip and camera")
     ap.add_argument('--limit-margin', type=float, default=5.0, help="deg inside the joint limits")
